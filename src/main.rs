@@ -47,8 +47,8 @@ fn fetch_from_github(
     async move {
         let mut builder = client.get(&url);
         for (key, value) in request_headers.iter() {
-            if key.as_str() == "host" {
-                match Url::parse(&url) {
+            match key.as_str() {
+                "host" => match Url::parse(&url) {
                     Ok(url) => {
                         if let Some(host) = url.host_str() {
                             builder = builder.header(key.clone(), host);
@@ -60,9 +60,13 @@ fn fetch_from_github(
                             url, err
                         );
                     }
+                },
+                "accept-encoding" => {
+                    // We don't handle decompression, so drop any requests for compression.
                 }
-            } else {
-                builder = builder.header(key.clone(), value.clone());
+                key => {
+                    builder = builder.header(key, value.clone());
+                }
             }
         }
         let response = builder.send().await.map_err(|err| {
