@@ -82,10 +82,16 @@ fn fetch_from_github(
             ));
         }
         let mut response_headers = response.headers().clone();
-        let mut values: OpaqueJsonArray = response.json().await.map_err(|err| {
+        let response_body = response.text().await.map_err(|err| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to parse response from github: {:?}", err),
+                format!("Failed to read response: {}", err),
+            )
+        })?;
+        let mut values: OpaqueJsonArray = serde_json::from_str(&response_body).map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read response \"{}\": {}", response_body, err),
             )
         })?;
         if let Some(link) = response_headers.remove("link") {
