@@ -1,10 +1,15 @@
-use axum::extract::Path;
+use std::num::NonZeroU16;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{http::header::HeaderMap, routing::get, Router};
 use futures::future::{BoxFuture, FutureExt};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use ttl_cache::TtlCache;
 
 #[tokio::main]
 async fn main() {
@@ -13,7 +18,13 @@ async fn main() {
         |s| s.into_string().expect("Failed to parse $PORT"),
     );
 
-    let app = Router::new().route("/*path", get(handler));
+    let app = Router::new()
+        .route("/*path", get(handler))
+        .route("/cached/:minutes/*path", get(cached_handler))
+        .with_state(AppState {
+            client: reqwest::Client::new(),
+            cache: Arc::new(Mutex::new(TtlCache::new(10000))),
+        });
 
     axum::Server::bind(
         &format!("0.0.0.0:{port}")
@@ -25,17 +36,76 @@ async fn main() {
     .unwrap();
 }
 
-async fn handler(Path(path): Path<String>, headers: HeaderMap) -> impl IntoResponse {
-    let client = reqwest::Client::new();
-    match fetch_from_github(client, format!("https://api.github.com/{}", path), headers).await {
-        Ok(response) => match serde_json::to_string(&response) {
-            Ok(response) => (StatusCode::OK, response),
-            Err(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to serialize response: {}", err),
-            ),
-        },
+async fn cached_handler(
+    State(state): State<AppState>,
+    Path((minutes, path)): Path<(NonZeroU16, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let key = CacheKey {
+        authorization_header: headers
+            .get("authorization")
+            .map(|h| h.as_bytes().to_owned()),
+        path: path.clone(),
+    };
+    let max_duration = Duration::from_secs(u64::from(u16::from(minutes) * 60));
+    {
+        let cache = state.cache.lock().unwrap();
+        if let Some(value) = cache.get(&key) {
+            if Instant::now().duration_since(value.generated_at) <= max_duration {
+                return serialize_for_response(&value.values);
+            }
+        }
+    }
+    match fetch_from_github(
+        state.client,
+        format!("https://api.github.com/{}", path),
+        headers,
+    )
+    .await
+    {
+        Ok(github_response) => {
+            let response = serialize_for_response(&github_response);
+            if response.0.is_success() {
+                let mut cache = state.cache.lock().unwrap();
+                cache.insert(
+                    key,
+                    CacheValue {
+                        generated_at: Instant::now(),
+                        values: github_response,
+                    },
+                    max_duration,
+                );
+            }
+            response
+        }
         Err((status_code, err)) => (status_code, err),
+    }
+}
+
+async fn handler(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    match fetch_from_github(
+        state.client,
+        format!("https://api.github.com/{}", path),
+        headers,
+    )
+    .await
+    {
+        Ok(response) => serialize_for_response(&response),
+        Err((status_code, err)) => (status_code, err),
+    }
+}
+
+fn serialize_for_response(response: &OpaqueJsonArray) -> (StatusCode, String) {
+    match serde_json::to_string(response) {
+        Ok(response) => (StatusCode::OK, response),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to serialize response: {}", err),
+        ),
     }
 }
 
@@ -138,4 +208,21 @@ fn fetch_from_github(
 struct OpaqueJsonArray {
     #[serde(flatten)]
     values: Vec<serde_json::Value>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    client: reqwest::Client,
+    cache: Arc<Mutex<TtlCache<CacheKey, CacheValue>>>,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct CacheKey {
+    authorization_header: Option<Vec<u8>>,
+    path: String,
+}
+
+struct CacheValue {
+    values: OpaqueJsonArray,
+    generated_at: std::time::Instant,
 }
