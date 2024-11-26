@@ -78,7 +78,7 @@ async fn cached_handler(
             }
             response
         }
-        Err((status_code, err)) => (status_code, err),
+        Err((status_code, err)) => (status_code, cors_allow_all(), err),
     }
 }
 
@@ -95,15 +95,16 @@ async fn handler(
     .await
     {
         Ok(response) => serialize_for_response(&response),
-        Err((status_code, err)) => (status_code, err),
+        Err((status_code, err)) => (status_code, cors_allow_all(), err),
     }
 }
 
-fn serialize_for_response(response: &OpaqueJsonArray) -> (StatusCode, String) {
+fn serialize_for_response(response: &OpaqueJsonArray) -> (StatusCode, HeaderMap, String) {
     match serde_json::to_string(response) {
-        Ok(response) => (StatusCode::OK, response),
+        Ok(response) => (StatusCode::OK, cors_allow_all(), response),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
+            cors_allow_all(),
             format!("Failed to serialize response: {}", err),
         ),
     }
@@ -201,6 +202,15 @@ fn fetch_from_github(
         Ok(values)
     }
     .boxed()
+}
+
+fn cors_allow_all() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        "*".parse().unwrap(),
+    );
+    headers
 }
 
 #[derive(Deserialize, Serialize)]
