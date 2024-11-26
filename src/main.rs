@@ -3,11 +3,12 @@ use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{http::header::HeaderMap, routing::get, Router};
 use futures::future::{BoxFuture, FutureExt};
+use indexmap::IndexMap;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use ttl_cache::TtlCache;
@@ -53,6 +54,7 @@ async fn main() {
 async fn cached_handler(
     State(state): State<AppState>,
     Path((minutes, path)): Path<(NonZeroU16, String)>,
+    Query(query): Query<IndexMap<String, String>>,
     mut headers: HeaderMap,
 ) -> impl IntoResponse {
     if !headers.contains_key(axum::http::header::AUTHORIZATION) {
@@ -77,7 +79,7 @@ async fn cached_handler(
     }
     match fetch_from_github(
         state.client,
-        format!("https://api.github.com/{}", path),
+        RequestableUrl::GitHubApi { path, query },
         headers,
     )
     .await
@@ -104,11 +106,12 @@ async fn cached_handler(
 async fn handler(
     State(state): State<AppState>,
     Path(path): Path<String>,
+    Query(query): Query<IndexMap<String, String>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     match fetch_from_github(
         state.client,
-        format!("https://api.github.com/{}", path),
+        RequestableUrl::GitHubApi { path, query },
         headers,
     )
     .await
@@ -131,10 +134,11 @@ fn serialize_for_response(response: &OpaqueJsonArray) -> (StatusCode, HeaderMap,
 
 fn fetch_from_github(
     client: reqwest::Client,
-    url: String,
+    url: RequestableUrl,
     request_headers: HeaderMap,
 ) -> BoxFuture<'static, Result<OpaqueJsonArray, (StatusCode, String)>> {
     async move {
+        let url = url.into_string();
         let mut builder = client.get(&url);
         for (key, value) in request_headers.iter() {
             match key.as_str() {
@@ -207,20 +211,55 @@ fn fetch_from_github(
                 }
             };
             if let Some(link) = link_map.get(&Some("next".to_owned())) {
-                let rest = fetch_from_github(client, link.uri.to_string(), request_headers)
-                    .await
-                    .map_err(|err| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to make follow-up request to github: {:?}", err),
-                        )
-                    })?;
+                let rest = fetch_from_github(
+                    client,
+                    RequestableUrl::Absolute(link.uri.to_string()),
+                    request_headers,
+                )
+                .await
+                .map_err(|err| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to make follow-up request to github: {:?}", err),
+                    )
+                })?;
                 values.values.extend(rest.values);
             }
         }
         Ok(values)
     }
     .boxed()
+}
+
+enum RequestableUrl {
+    GitHubApi {
+        path: String,
+        query: IndexMap<String, String>,
+    },
+    Absolute(String),
+}
+
+impl RequestableUrl {
+    fn into_string(self) -> String {
+        match self {
+            RequestableUrl::GitHubApi { path, query } => {
+                let mut url = url::Url::parse("https://api.github.com/")
+                    .unwrap()
+                    .join(&path)
+                    // TODO: Justify this unwrap.
+                    .unwrap();
+                url.set_query(Some(
+                    &query
+                        .iter()
+                        .map(|(key, value)| format!("{key}={value}"))
+                        .collect::<Vec<_>>()
+                        .join("&"),
+                ));
+                url.to_string()
+            }
+            RequestableUrl::Absolute(url) => url,
+        }
+    }
 }
 
 fn cors_allow_all() -> HeaderMap {
