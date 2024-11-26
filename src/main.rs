@@ -1,3 +1,4 @@
+use std::env::VarError;
 use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,12 +19,25 @@ async fn main() {
         |s| s.into_string().expect("Failed to parse $PORT"),
     );
 
+    let default_auth_header = match std::env::var("DEFAULT_AUTH_HEADER") {
+        Ok(value) => {
+            let result = value.parse();
+            match result {
+                Ok(value) => Some(value),
+                Err(err) => panic!("Failed to parse default auth header as header: {:?}", err),
+            }
+        }
+        Err(VarError::NotPresent) => None,
+        Err(VarError::NotUnicode(_)) => panic!("Failed to parse default auth header as unicode"),
+    };
+
     let app = Router::new()
         .route("/*path", get(handler))
         .route("/cached/:minutes/*path", get(cached_handler))
         .with_state(AppState {
             client: reqwest::Client::new(),
             cache: Arc::new(Mutex::new(TtlCache::new(10000))),
+            default_auth_header,
         });
 
     axum::Server::bind(
@@ -39,11 +53,16 @@ async fn main() {
 async fn cached_handler(
     State(state): State<AppState>,
     Path((minutes, path)): Path<(NonZeroU16, String)>,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
 ) -> impl IntoResponse {
+    if !headers.contains_key(axum::http::header::AUTHORIZATION) {
+        if let Some(default_auth_header) = state.default_auth_header {
+            headers.append(axum::http::header::AUTHORIZATION, default_auth_header);
+        }
+    };
     let key = CacheKey {
         authorization_header: headers
-            .get("authorization")
+            .get(axum::http::header::AUTHORIZATION)
             .map(|h| h.as_bytes().to_owned()),
         path: path.clone(),
     };
@@ -224,6 +243,7 @@ struct OpaqueJsonArray {
 struct AppState {
     client: reqwest::Client,
     cache: Arc<Mutex<TtlCache<CacheKey, CacheValue>>>,
+    default_auth_header: Option<axum::http::header::HeaderValue>,
 }
 
 #[derive(Hash, PartialEq, Eq)]
